@@ -28,12 +28,14 @@ udf_recover.py — UDF 光盘"删除历史"查看与文件恢复工具
 """
 
 import argparse
+import ctypes
 import fnmatch
 import json
 import os
 import re
 import struct
 import sys
+import threading
 import time
 from collections import deque
 
@@ -63,6 +65,8 @@ class DeviceSource:
             raise OSError(last_err.errno if last_err else 22,
                           "无法打开 %s (尝试了 %s)"
                           % (path, ", ".join(DeviceSource._candidates(path))))
+        self.broken = False
+        self._io_lock = threading.Lock()
 
     @staticmethod
     def _candidates(path):
@@ -84,12 +88,54 @@ class DeviceSource:
                 uniq.append(x)
         return uniq
 
-    def read(self, lba, nsectors):
-        self.f.seek(lba * SECTOR)
-        data = self.f.read(nsectors * SECTOR)
-        if len(data) != nsectors * SECTOR:
-            raise ReadUnavailable("LBA %d (+%d) 短读" % (lba, nsectors))
-        return data
+    def read(self, lba, nsectors, timeout=90.0):
+        """带硬超时的读:超时后 CancelIoEx 取消挂起 IRP,避免卷栈楔死时无限挂。
+
+        冷启动唤醒等长等待请显式传更大的 timeout(如 240)。
+        超时且无法取消时置 broken,后续读立即失败并提示重新插盘。
+        """
+        if getattr(self, "broken", False):
+            raise ReadUnavailable("设备句柄已失效——请重新插盘/重插 USB 后重试")
+        need = nsectors * SECTOR
+        result = {}
+        lock = getattr(self, "_io_lock", None)
+        if lock is None:
+            lock = self._io_lock = threading.Lock()
+
+        def work():
+            try:
+                with lock:
+                    self.f.seek(lba * SECTOR)
+                    result["d"] = self.f.read(need)
+            except OSError as e:
+                result["e"] = e
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(timeout)
+        if "d" in result:
+            if len(result["d"]) != need:
+                raise ReadUnavailable("LBA %d (+%d) 短读" % (lba, nsectors))
+            return result["d"]
+        # 超时:尝试取消挂起的 IRP
+        try:
+            import msvcrt
+            ctypes.windll.kernel32.CancelIoEx(
+                msvcrt.get_osfhandle(self.f.fileno()), None)
+        except Exception:
+            pass
+        t.join(3)
+        if "d" in result:
+            if len(result["d"]) != need:
+                raise ReadUnavailable("LBA %d (+%d) 短读" % (lba, nsectors))
+            return result["d"]
+        if "e" in result:
+            raise result["e"]
+        self.broken = True
+        raise ReadUnavailable(
+            "读 LBA %d 超时(>%ds)且无法取消——光驱卷栈可能已楔死"
+            "(常见原因:扫描中途换过盘)。请重新插一次盘或重插 USB 再试"
+            % (lba, int(timeout)))
 
     def close(self):
         try:
@@ -100,6 +146,7 @@ class DeviceSource:
 
 class ImageSource:
     kind = "image"
+    broken = False
 
     def __init__(self, img_path):
         map_path = img_path + ".map.json"
@@ -117,7 +164,7 @@ class ImageSource:
         end = lba + nsectors
         return any(a <= lba and end <= b for a, b in self.runs)
 
-    def read(self, lba, nsectors):
+    def read(self, lba, nsectors, timeout=None):
         end = lba + nsectors
         for (a, b), base in zip(self.runs, self.offsets):
             if a <= lba and end <= b:
@@ -324,15 +371,15 @@ def probe_readable_end(src, max_lba, max_slow=3):
     返回 (end_lba, 探测次数, 慢失败次数)。探测到慢失败过多时提前收手,
     返回当前已知下界(此时调用方仍会走原有的错误自适应逻辑)。
     """
-    def ok(lba):
+    def ok(lba, tmo=90):
         t0 = time.perf_counter()
         try:
-            src.read(lba, 32)
+            src.read(lba, 32, timeout=tmo)
             return True, time.perf_counter() - t0
         except (ReadUnavailable, OSError):
             return False, time.perf_counter() - t0
 
-    good, _ = ok(0)
+    good, _ = ok(0, 240)          # 冷启动唤醒给足时间
     if not good:
         return 0, 1, 0
     if ok(max_lba - 32)[0]:

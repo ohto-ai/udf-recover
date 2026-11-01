@@ -346,9 +346,11 @@ class App:
                 self._prog(None, "正在唤醒光驱(冷启动可能需要 1-2 分钟)…")
                 self._log("[*] 正在唤醒光驱;若刚插入/闲置已久,此步可能较慢…")
                 try:
-                    src.read(0, 32)
-                except Exception:
-                    pass
+                    src.read(0, 32, timeout=240)
+                except core.ReadUnavailable as e:
+                    raise RuntimeError(
+                        "光驱无响应:%s\n"
+                        "若刚弹过盘/换过盘,请重新插一次盘(或重插 USB)后重试。" % e)
                 self._log("[*] 光驱已就绪。")
             max_lba = 2304000 if src.kind == "device" else 10 ** 9
             depth = self.var_depth.get()
