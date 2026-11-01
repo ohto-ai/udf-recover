@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "udf-recover"
+version = "1.0.0"
+description = "View deletion history and recover files from UDF 'Live File System' optical discs (Windows-burned DVD±R / CD-R)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "ohto-ai" }]
+keywords = [
+    "udf", "optical-disc", "dvd", "cd-r", "data-recovery",
+    "live-file-system", "forensics", "windows",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Legal Industry",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Recovery Tools",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/ohto-ai/udf-recover"
+Issues = "https://github.com/ohto-ai/udf-recover/issues"
+
+[project.scripts]
+udf-recover = "udf_recover:main"
+udf-recover-gui = "udf_recover_gui:main"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+py-modules = ["udf_recover", "udf_recover_gui"]
