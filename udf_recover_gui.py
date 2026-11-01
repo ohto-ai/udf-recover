@@ -13,6 +13,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import types
 
@@ -94,12 +95,19 @@ class App:
         out.pack(fill="x", **pad)
         ttk.Label(out, text="输出目录:").pack(side="left")
         self.var_out = tk.StringVar(value=DEFAULT_OUT)
-        ttk.Entry(out, textvariable=self.var_out, width=60).pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Entry(out, textvariable=self.var_out, width=52).pack(side="left", padx=4, fill="x", expand=True)
         ttk.Button(out, text="浏览…", width=8, command=self._pick_out).pack(side="left")
-        self.var_fast = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            out, text="快速模式(跳过已识别的文件数据区,数据越满加速越明显)",
-            variable=self.var_fast).pack(side="left", padx=(10, 0))
+
+        depth = ttk.Frame(top)
+        depth.pack(fill="x", **pad)
+        ttk.Label(depth, text="扫描深度:").pack(side="left")
+        self.var_depth = tk.StringVar(value="fast")
+        ttk.Radiobutton(depth, text="预览(几秒,只看卷头+卷尾,可能漏中段旧表)",
+                        variable=self.var_depth, value="preview").pack(side="left", padx=(6, 4))
+        ttk.Radiobutton(depth, text="快速(默认,跳过已识别的文件数据区)",
+                        variable=self.var_depth, value="fast").pack(side="left", padx=4)
+        ttk.Radiobutton(depth, text="完整(最保守,扫遍整个可读区)",
+                        variable=self.var_depth, value="full").pack(side="left", padx=4)
 
         # ---- 结果表 ----
         mid = ttk.Frame(top)
@@ -333,20 +341,33 @@ class App:
         self._log("[*] 数据源: %s" % (ns.image or ns.device))
         src = core.open_source(ns)
         try:
+            if src.kind == "device":
+                # 光驱闲置会停转,冷启动的首笔读可能要 1-2 分钟,显式唤醒
+                self._prog(None, "正在唤醒光驱(冷启动可能需要 1-2 分钟)…")
+                self._log("[*] 正在唤醒光驱;若刚插入/闲置已久,此步可能较慢…")
+                try:
+                    src.read(0, 32)
+                except Exception:
+                    pass
+                self._log("[*] 光驱已就绪。")
             max_lba = 2304000 if src.kind == "device" else 10 ** 9
+            depth = self.var_depth.get()
+            fast = depth == "fast"
+            preview = depth == "preview"
             n_mb = max(1, max_lba * core.SECTOR // (1024 * 1024))
-            fast = self.var_fast.get()
+            t0 = time.perf_counter()
 
             def on_prog(pos):
-                self._prog(pos / max_lba, "扫描中 %d MB / ~%d MB"
-                           % (pos * core.SECTOR // 1048576, n_mb))
+                dt = time.perf_counter() - t0
+                mb = pos * core.SECTOR / 1048576
+                spd = ("%.2f MB/s" % (mb / dt)) if dt > 0.5 and mb > 1 else ""
+                self._prog(pos / max_lba, "扫描中 %.0f MB / ~%d MB %s"
+                           % (mb, n_mb, spd))
 
             ctx, runs, skipped = core.scan_source(
-                src, max_lba, fast=fast, progress=False,
-                on_chunk=lambda pos, data: on_prog(pos))
-            if fast and skipped:
-                self._log("[*] 快速模式: 跳过已识别文件数据区 %.1f MB"
-                          % (skipped * core.SECTOR / 1048576))
+                src, max_lba, fast=fast, preview=preview, progress=False,
+                on_chunk=(lambda pos, data: on_prog(pos)) if not preview else None,
+                log=self._log)
             if not runs:
                 raise RuntimeError("没有读到任何数据——光驱里没放盘?")
             self._log("[*] 已扫读区: %s (共 %.1f MB)"

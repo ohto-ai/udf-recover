@@ -152,8 +152,9 @@ def open_source(args):
 # ---------------------------------------------------------------- 扫描引擎
 
 def iter_readable_chunks(src, max_lba, chunk=256, skip=32, stop_err_mb=96, quiet=False,
-                         runs_out=None, progress=False, skip_zones=None, skip_stats=None):
-    """顺序扫过 0..max_lba,自适应跳过读不出来的区段。
+                         runs_out=None, progress=False, skip_zones=None, skip_stats=None,
+                         start_lba=0):
+    """顺序扫过 start_lba..max_lba,自适应跳过读不出来的区段。
 
     - 读错误时按 32 扇区细分重试(找块内边界);
     - 整块失败则跳步倍增(64KB -> 最大 8MB),成功后二分回探把边界找回;
@@ -166,7 +167,7 @@ def iter_readable_chunks(src, max_lba, chunk=256, skip=32, stop_err_mb=96, quiet
     runs = runs_out if runs_out is not None else []
     max_skip = 4096                    # 8MB
     stop_err_sectors = stop_err_mb * 1024 * 1024 // SECTOR
-    pos = 0
+    pos = start_lba
     consec_err = 0                     # 连续失败的扇区数(含跳过的)
     cur_skip = skip
     gap_total = 0
@@ -317,56 +318,139 @@ def iter_readable_chunks(src, max_lba, chunk=256, skip=32, stop_err_mb=96, quiet
             print("[!] 没有任何可读扇区")
 
 
-def scan_source(src, max_lba, fast=True, chunk=256, skip=32, stop_err_mb=96,
-                progress=False, on_chunk=None, log=None):
+def probe_readable_end(src, max_lba, max_slow=3):
+    """二分探测最后可读 LBA(假设可读区是从 0 开始的前缀)。
+
+    返回 (end_lba, 探测次数, 慢失败次数)。探测到慢失败过多时提前收手,
+    返回当前已知下界(此时调用方仍会走原有的错误自适应逻辑)。
+    """
+    def ok(lba):
+        t0 = time.perf_counter()
+        try:
+            src.read(lba, 32)
+            return True, time.perf_counter() - t0
+        except (ReadUnavailable, OSError):
+            return False, time.perf_counter() - t0
+
+    good, _ = ok(0)
+    if not good:
+        return 0, 1, 0
+    if ok(max_lba - 32)[0]:
+        return max_lba, 1, 0
+    lo, hi = 0, max_lba
+    probes, slow = 2, 0
+    while hi - lo > 32:
+        mid = (lo + hi) // 2 // 32 * 32
+        good, dt = ok(mid)
+        probes += 1
+        if not good and dt > 1.5:
+            slow += 1
+            if slow >= max_slow:
+                break
+        if good:
+            lo = mid
+        else:
+            hi = mid
+    return lo + 32, probes, slow
+
+
+def scan_source(src, max_lba, fast=True, chunk=512, skip=32, stop_err_mb=96,
+                progress=False, on_chunk=None, log=None, preview=False):
+    if log and src.kind == 'device':
+        log('[*] 提示: 若光驱已闲置停转,冷启动后首次读取可能需要 1-2 分钟')
     """扫描数据源并解析全部 UDF 描述符,返回 (ctx, runs, skipped_bytes)。
 
-    fast=True: 一边扫一边把「已识别文件的数据区段」加入跳过名单——
-    一次性介质的区段互不重叠,文件数据里不可能再藏别的文件表,
-    所以大文件的数据区可以整段不读(数据越满的盘加速越明显)。
-    fast=False: 退化为完整顺序扫描(旧行为,最保守)。
+    preview=True: 只读卷头(前 2MB)+ 卷尾(最后 8MB),几秒出结果,
+                  适合快速看一眼;可能漏掉盘片中段的旧文件表。
+    fast=True:   一边扫一边把「已识别文件的数据区段」加入跳过名单——
+                 一次性介质的区段互不重叠,文件数据里不可能再藏别的
+                 文件表,所以大文件的数据区可以整段不读。
+                 注意:Windows VAT 式增量写入的"存根"条目不带区段,
+                 无法跳过,此时快速模式退化为接近完整扫描。
+    fast=False:  完整顺序扫描(最保守)。
+    扫描前先二分探测可读上界,避免在不可读尾部做大量慢失败试探。
     on_chunk(pos, data): 每读一块的回调(如特征码统计)。
     """
+    t0 = time.perf_counter()
     ctx = ScanContext(src, None)
     ctx.vol = Volume()
     runs = []
     skip_zones = []
     skip_stats = [0]
-    for pos, data in iter_readable_chunks(
-            src, max_lba, chunk=chunk, skip=skip, stop_err_mb=stop_err_mb,
-            runs_out=runs, progress=progress,
-            skip_zones=skip_zones if fast else None,
-            skip_stats=skip_stats if fast else None):
-        before = len(ctx.fes)
-        ctx.examine(pos, data)
-        if on_chunk:
-            on_chunk(pos, data)
+
+    def zones_to_iter(zones):
+        for a, b in zones:
+            if b <= a:
+                continue
+            sub_runs = []
+            for pos, data in iter_readable_chunks(
+                    src, b, chunk=chunk, skip=skip, stop_err_mb=stop_err_mb,
+                    runs_out=sub_runs, start_lba=a, quiet=True):
+                yield pos, data
+            runs.extend(sub_runs)
+
+    if preview:
+        end, probes, slow = probe_readable_end(src, max_lba)
+        if log:
+            log("[*] 预览模式: 可读上界 LBA %d (探测 %d 次)"
+                % (end, probes))
+        head_end = min(1024, end)
+        tail_start = max(0, end - 8192)
+        zones = [(0, head_end)]
+        if tail_start > head_end:
+            zones.append((tail_start, end))
+        for pos, data in zones_to_iter(zones):
+            ctx.examine(pos, data)
+            if on_chunk:
+                on_chunk(pos, data)
+    else:
         if fast:
-            # 分区信息一到手就解析,后续 FE 的区段才能换算成绝对地址
-            if not ctx.vol.partitions and ctx.tags.get(5) and ctx.tags.get(6):
-                try:
-                    ctx.vol = parse_volume_descriptors(ctx)
-                except Exception:
-                    pass
-            if ctx.vol.partitions and len(ctx.fes) > before:
-                for fe in list(ctx.fes.values())[before:]:
-                    for ext in fe["extents"]:
-                        if ext["lbn"] is None or ext["flag"] != 0:
-                            continue
-                        if ext["len"] < 64 * 1024:   # 小段可能是元数据,不跳
-                            continue
-                        try:
-                            a = ctx.vol.abs_lba(ext["lbn"], ext["part"] or 0,
-                                                context_lba=fe["lba"])
-                        except (ReadUnavailable, OSError):
-                            continue
-                        nsec = (ext["len"] + SECTOR - 1) // SECTOR
-                        if len(skip_zones) < 500:
-                            skip_zones.append([a, min(a + nsec, max_lba)])
+            end, probes, slow = probe_readable_end(src, max_lba)
+            if end:
+                max_lba = min(max_lba, end)
+            if log and probes > 1:
+                log("[*] 可读上界探测: LBA %d (%d 次探测)"
+                    % (end, probes))
+        for pos, data in iter_readable_chunks(
+                src, max_lba, chunk=chunk, skip=skip, stop_err_mb=stop_err_mb,
+                runs_out=runs, progress=progress,
+                skip_zones=skip_zones if fast else None,
+                skip_stats=skip_stats if fast else None):
+            before = len(ctx.fes)
+            ctx.examine(pos, data)
+            if on_chunk:
+                on_chunk(pos, data)
+            if fast:
+                # 分区信息一到手就解析,后续 FE 的区段才能换算成绝对地址
+                if not ctx.vol.partitions and ctx.tags.get(5) and ctx.tags.get(6):
+                    try:
+                        ctx.vol = parse_volume_descriptors(ctx)
+                    except Exception:
+                        pass
+                if ctx.vol.partitions and len(ctx.fes) > before:
+                    for fe in list(ctx.fes.values())[before:]:
+                        for ext in fe["extents"]:
+                            if ext["lbn"] is None or ext["flag"] != 0:
+                                continue
+                            if ext["len"] < 64 * 1024:   # 小段可能是元数据,不跳
+                                continue
+                            try:
+                                a = ctx.vol.abs_lba(ext["lbn"], ext["part"] or 0,
+                                                    context_lba=fe["lba"])
+                            except (ReadUnavailable, OSError):
+                                continue
+                            nsec = (ext["len"] + SECTOR - 1) // SECTOR
+                            if len(skip_zones) < 500:
+                                skip_zones.append([a, min(a + nsec, max_lba)])
     ctx.after_scan()
-    if log and fast and skip_stats[0]:
-        log("[*] 快速模式: 跳过已识别文件数据区 %.1f MB"
-            % (skip_stats[0] * SECTOR / 1048576))
+    if log:
+        elapsed = time.perf_counter() - t0
+        read_mb = sum(b - a for a, b in runs) * SECTOR / 1048576
+        msg = "[*] 扫描完成: 实读 %.1f MB, 耗时 %.1f 秒 (%.2f MB/s)" % (
+            read_mb, elapsed, read_mb / elapsed if elapsed > 0 else 0)
+        if skip_stats[0]:
+            msg += ", 跳过已识别文件数据 %.1f MB" % (skip_stats[0] * SECTOR / 1048576)
+        log(msg)
     return ctx, runs, skip_stats[0]
 
 
@@ -983,6 +1067,7 @@ def cmd_history(args):
     max_lba = args.max_lba or (2304000 if src.kind == "device" else 10 ** 9)
     ctx, _runs, _sk = scan_source(
         src, max_lba, fast=not getattr(args, "full", False),
+        preview=getattr(args, "preview", False),
         chunk=args.chunk, skip=args.skip, stop_err_mb=args.stop_errors_mb,
         progress=True,
         on_chunk=(lambda pos, data: sniff_signatures(ctx, pos, data))
@@ -1331,7 +1416,7 @@ def main():
     ap.add_argument("--device", default=r"\\.\E:", help="光驱设备路径,默认 \\\\.\\E:")
     ap.add_argument("--image", help="改用镜像文件(由 image 子命令生成)")
     ap.add_argument("--max-lba", type=int, default=None, help="扫描上限(LBA)")
-    ap.add_argument("--chunk", type=int, default=256, help="每次读取扇区数(默认256)")
+    ap.add_argument("--chunk", type=int, default=512, help="每次读取扇区数(默认512,即1MB)")
     ap.add_argument("--skip", type=int, default=32, help="读错误时前跳扇区数(默认32)")
     ap.add_argument("--stop-errors-mb", type=int, default=96,
                     help="连续不可读超过多少 MB 就停止(默认96)")
@@ -1363,6 +1448,8 @@ def main():
 
     p = sub.add_parser("history", aliases=["list"], help="全盘扫描文件表,列出删除历史")
     p.add_argument("--scan-signatures", action="store_true", help="同时做媒体特征码扫描")
+    p.add_argument("--preview", action="store_true",
+                   help="预览模式: 只读卷头+卷尾(几秒),可能漏掉中段旧文件表")
     add_common(p)
     p.set_defaults(func=cmd_history)
 
