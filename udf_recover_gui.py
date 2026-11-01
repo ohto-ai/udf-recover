@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 import types
+import ctypes
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -26,6 +27,65 @@ import udf_recover as core
 STATE_ORDER = {"当前": 0, "历史版本": 1, "已删除": 2, "孤儿(无目录表引用)": 3}
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(SCRIPT_DIR, "recovered")
+
+
+def cdrom_letters():
+    """枚举 CD-ROM 类型的盘符。只用轻量 API,不触碰卷栈(楔死也不会卡)。"""
+    k = ctypes.windll.kernel32
+    bits = k.GetLogicalDrives()
+    out = []
+    for i in range(26):
+        if bits >> i & 1:
+            L = chr(ord("A") + i)
+            try:
+                if k.GetDriveTypeW(L + ":\\") == 5:      # DRIVE_CDROM
+                    out.append(L)
+            except Exception:
+                pass
+    return out
+
+
+def drive_media_state(letter, timeout=2.5):
+    """检查光驱里是否有盘。返回 (0=有盘, 1=无盘, 2=无响应), label。
+
+    在独立线程里执行并限时:卷栈楔死时 GetVolumeInformationW 可能阻塞,
+    绝不能卡住 GUI 主线程。
+    """
+    R = {}
+
+    def work():
+        try:
+            k = ctypes.windll.kernel32
+            buf = ctypes.create_unicode_buffer(256)
+            ok = k.GetVolumeInformationW(letter + ":\\", buf, 256,
+                                         None, None, None, None, 0)
+            R["v"] = (0, buf.value) if ok else (1, "")
+        except Exception:
+            R["v"] = (1, "")
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    return R.get("v", (2, ""))
+
+
+def query_drive_names(timeout=12):
+    """用 WMI 拿光驱型号名,返回 {盘符: 描述};失败/超时返回空表。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_CDROMDrive | "
+             "ForEach-Object { '{0}|{1}' -f $_.Drive, $_.Caption }"],
+            capture_output=True, text=True, timeout=timeout)
+        out = {}
+        for line in (r.stdout or "").splitlines():
+            if "|" in line:
+                drv, cap = line.split("|", 1)
+                out[drv.strip().rstrip(":")] = cap.strip()
+        return out
+    except Exception:
+        return {}
 
 
 class App:
@@ -44,6 +104,12 @@ class App:
         self.job_name = ""
 
         self._build_ui()
+        self._drive_names = {}
+        self._last_drive_sig = None
+        self._prev_media = {}
+        self._polling = False
+        self._refresh_drive_list()
+        self.root.after(3000, self._poll_drives)
         self.root.after(80, self._poll)
         self._log("就绪。插好盘选「光驱」,或选已有镜像文件,然后点「扫描」。")
 
@@ -63,19 +129,23 @@ class App:
 
         rb1 = ttk.Radiobutton(src, text="光驱", variable=self.var_mode, value="device",
                               command=self._on_mode)
-        self.ent_device = ttk.Entry(src, textvariable=self.var_device, width=14)
-        lbl_e = ttk.Label(src, text="例: \\\\.\\E:")
+        self.cmb_device = ttk.Combobox(src, width=40)
+        self.cmb_device.bind("<<ComboboxSelected>>", self._on_drive_selected)
+        btn_rfrsh = ttk.Button(src, text="刷新", width=6, command=self._refresh_drives_clicked)
+        self.lbl_drive = ttk.Label(src, text="")
         rb2 = ttk.Radiobutton(src, text="镜像文件", variable=self.var_mode, value="image",
                               command=self._on_mode)
-        self.ent_image = ttk.Entry(src, textvariable=self.var_image, width=52)
+        self.ent_image = ttk.Entry(src, textvariable=self.var_image, width=44)
         btn_img = ttk.Button(src, text="浏览…", width=8, command=self._pick_image)
 
         rb1.grid(row=0, column=0, padx=(8, 2), pady=6)
-        self.ent_device.grid(row=0, column=1, pady=6)
-        lbl_e.grid(row=0, column=2, padx=(0, 12))
-        rb2.grid(row=0, column=3, padx=(0, 2))
-        self.ent_image.grid(row=0, column=4, pady=6)
-        btn_img.grid(row=0, column=5, padx=(4, 8))
+        self.cmb_device.grid(row=0, column=1, columnspan=2, pady=6, sticky="we")
+        btn_rfrsh.grid(row=0, column=3, padx=(4, 8))
+        self.lbl_drive.grid(row=1, column=1, columnspan=3, sticky="w")
+        rb2.grid(row=2, column=0, padx=(8, 2), pady=6)
+        self.ent_image.grid(row=2, column=1, columnspan=2, pady=6, sticky="we")
+        btn_img.grid(row=2, column=3, padx=(4, 8))
+        src.columnconfigure(1, weight=1)
 
         # ---- 操作按钮 ----
         acts = ttk.Frame(top)
@@ -147,8 +217,91 @@ class App:
 
     def _on_mode(self):
         is_dev = self.var_mode.get() == "device"
-        self.ent_device.configure(state="normal" if is_dev else "disabled")
+        self.cmb_device.configure(state="normal" if is_dev else "disabled")
         self.ent_image.configure(state="normal" if not is_dev else "disabled")
+
+    # ---- 光驱枚举与插盘自动刷新 ----
+
+    def _on_drive_selected(self, _evt=None):
+        text = self.cmb_device.get()
+        path = text.split(" — ")[0].strip()
+        if path:
+            self.var_device.set(path)
+            self.var_mode.set("device")
+            self._on_mode()
+
+    def _poll_drives(self):
+        """每 3 秒轮询插盘状态;轮询在后台线程做,楔死也不卡界面。"""
+        if not self.busy and not self._polling:
+            self._polling = True
+
+            def job():
+                data = [(L,) + tuple(drive_media_state(L)) for L in cdrom_letters()]
+                self.log_q.put(("drives", (data, True)))
+                self._polling = False
+
+            threading.Thread(target=job, daemon=True).start()
+        self.root.after(3000, self._poll_drives)
+
+    def _refresh_drives_clicked(self):
+        def job():
+            self._drive_names = query_drive_names()
+            data = [(L,) + tuple(drive_media_state(L)) for L in cdrom_letters()]
+            self.log_q.put(("drives", (data, False)))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _refresh_drive_list(self, quiet=False, with_names=False):
+        def job():
+            if with_names:
+                self._drive_names = query_drive_names()
+            data = [(L,) + tuple(drive_media_state(L)) for L in cdrom_letters()]
+            self.log_q.put(("drives", (data, quiet)))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _apply_drive_list(self, data, quiet=False):
+        """把 (盘符, 状态, 标签) 列表应用到下拉框;检测插盘/弹盘事件。"""
+        descs, media_now = [], {}
+        for L, state, label in data:
+            path = "\\\\.\\%s:" % L
+            media_now[path] = state
+            if state == 0:
+                m = "有盘[%s]" % (label or "?")
+            elif state == 1:
+                m = "无盘"
+            else:
+                m = "无响应(光驱忙/栈异常)"
+            nm = self._drive_names.get(L)
+            descs.append("%s — %s%s" % (path, m, (" · " + nm) if nm else ""))
+            if not quiet and self._prev_media and self._prev_media.get(path) != state:
+                what = {0: "检测到新盘片: %s (%s)" % (path, label or "?"),
+                        1: "盘片已弹出: %s" % path,
+                        2: "光驱状态未知: %s" % path}.get(state)
+                if what:
+                    self._log("[*] " + what)
+        self._prev_media = media_now
+
+        sig = ";".join(descs)
+        if sig != self._last_drive_sig:
+            self._last_drive_sig = sig
+            self.cmb_device["values"] = descs
+            cur = self.var_device.get().strip()
+            keep = next((x for x in descs if x.split(" — ")[0] == cur), None)
+            if keep:
+                self.cmb_device.set(keep)
+            elif descs:
+                prefer = next((x for x in descs if "有盘" in x), descs[0])
+                self.cmb_device.set(prefer)
+                self.var_device.set(prefer.split(" — ")[0])
+                if not quiet:
+                    self._log("[*] 已选择光驱: %s" % self.var_device.get())
+            elif not quiet:
+                self._log("[!] 未检测到光驱;仍可手动输入设备路径(如 \\\\.\\CdRom0)")
+        cur = self.var_device.get().strip()
+        desc = next((x for x in descs if x.split(" — ")[0] == cur), None)
+        if desc:
+            self.lbl_drive.configure(text="当前: " + desc.split(" — ", 1)[-1])
 
     # ------------------------------------------------------------ 小工具
 
@@ -188,6 +341,9 @@ class App:
                     getattr(messagebox, k)(t, m)
                 elif kind == "fill":
                     self._fill_tree(payload)
+                elif kind == "drives":
+                    data, quiet = payload
+                    self._apply_drive_list(data, quiet)
                 elif kind == "done":
                     self.busy = False
                     self._set_buttons(True)
